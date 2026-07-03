@@ -11,6 +11,7 @@ Three tools:
 import modal
 import base64
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -29,59 +30,103 @@ image = (
         "sse-starlette",
         "uvicorn",
     )
-    # Install yt-dlp last and force latest — platforms break old versions constantly
-    .run_commands("pip install --no-cache-dir --upgrade yt-dlp")
+    # Install yt-dlp last and force latest — platforms break old versions constantly.
+    # force_build=True rebuilds THIS layer on every deploy so yt-dlp is always current
+    # (the heavy torch/whisper layer above stays cached, so the rebuild is cheap). Without
+    # this, Modal caches the identical command and we silently ship a months-old yt-dlp
+    # that TikTok/IG have already broken — which is exactly what happened.
+    .run_commands("pip install --no-cache-dir --upgrade yt-dlp", force_build=True)
 )
 
 app = modal.App("video-watch-mcp", image=image)
+
+
+def has_audio_stream(video_path: str) -> bool:
+    """True if the downloaded file actually contains an audio stream."""
+    probe = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=codec_type",
+        "-of", "json", video_path
+    ], capture_output=True, text=True)
+    try:
+        return len(json.loads(probe.stdout).get("streams", [])) > 0
+    except Exception:
+        return False
 
 
 def download_video(url: str, video_path: str) -> dict:
     """Download video with platform-aware fallbacks, return success/error."""
     is_tiktok = "tiktok.com" in url or "tiktok" in url.lower()
 
-    # Format: prefer merged <=720p, fall back to best merged, fall back to best anything
-    # This handles YouTube's split video+audio streams properly
-    fmt = "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
-
-    base_args = [
-        "yt-dlp",
-        "-f", fmt,
-        "--merge-output-format", "mp4",
-        "-o", video_path,
-        "--no-playlist",
-        "--socket-timeout", "30",
-    ]
-
-    # Strategy 1: browser impersonation (works for most platforms)
-    attempt1 = base_args + ["--impersonate", "chrome", url]
-    result = subprocess.run(attempt1, capture_output=True, text=True)
-    if result.returncode == 0:
-        return {"success": True}
-
-    # Strategy 2: for TikTok, try without impersonation but with extractor args
+    # Format ladder. TikTok's bytevc1/h265 variants are frequently served
+    # WITHOUT their audio track even though the format metadata claims aac —
+    # the download succeeds and yields a mute file (verified 3 Jul 2026:
+    # bytevc1_1080p = video-only in reality, h264_720p = real HE-AAC audio).
+    # yt-dlp can't see the lie from metadata, so no selector alone is safe:
+    # we verify the *downloaded file* with ffprobe and climb the ladder if
+    # audio is missing. For TikTok, h264 first; watermarked "download" format
+    # last (TikTok's own export — ugly but always has sound).
+    general_fmt = "bestvideo*+bestaudio/best"
     if is_tiktok:
-        attempt2 = base_args + [
-            "--extractor-args", "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com",
-            url
+        fmts = [
+            "b[vcodec^=h264]/bv*[vcodec^=h264]+ba",  # honest codec first
+            general_fmt,                              # whatever merges
+            "download",                               # watermarked, real audio
         ]
-        result = subprocess.run(attempt2, capture_output=True, text=True)
-        if result.returncode == 0:
-            return {"success": True}
+    else:
+        fmts = [general_fmt]
 
-    # Strategy 3: simplest possible — no impersonation, basic format
-    attempt3 = [
-        "yt-dlp",
-        "-f", "best",
-        "-o", video_path,
-        "--no-playlist",
-        url
-    ]
-    result = subprocess.run(attempt3, capture_output=True, text=True)
-    if result.returncode == 0:
-        return {"success": True}
+    def attempts_for(fmt: str) -> list[list[str]]:
+        base_args = [
+            "yt-dlp",
+            "-f", fmt,
+            "--merge-output-format", "mp4",
+            "-o", video_path,
+            "--no-playlist",
+            "--socket-timeout", "30",
+        ]
+        # Strategy 1: browser impersonation (works for most platforms)
+        attempts = [base_args + ["--impersonate", "chrome", url]]
+        # Strategy 2: for TikTok, no impersonation but alternate API host
+        if is_tiktok:
+            attempts.append(base_args + [
+                "--extractor-args", "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com",
+                url
+            ])
+        # Strategy 3: simplest possible — no impersonation
+        attempts.append([
+            "yt-dlp",
+            "-f", fmt,
+            "--merge-output-format", "mp4",
+            "-o", video_path,
+            "--no-playlist",
+            url
+        ])
+        return attempts
 
-    return {"success": False, "error": result.stderr[-500:] if result.stderr else "Unknown download error"}
+    result = None
+    mute_fallback = None  # best video-only download, in case nothing has audio
+    for fmt in fmts:
+        for attempt in attempts_for(fmt):
+            if os.path.exists(video_path):
+                os.remove(video_path)
+            result = subprocess.run(attempt, capture_output=True, text=True)
+            if result.returncode != 0:
+                continue
+            if has_audio_stream(video_path):
+                return {"success": True}
+            # Downloaded fine but mute — keep one copy as a last resort and
+            # keep climbing the ladder for a version with sound.
+            if mute_fallback is None:
+                mute_fallback = video_path + ".mute.mp4"
+                os.replace(video_path, mute_fallback)
+
+    if mute_fallback is not None:
+        os.replace(mute_fallback, video_path)
+        return {"success": True, "warning": "no audio track available in any variant"}
+
+    return {"success": False, "error": result.stderr[-500:] if result and result.stderr else "Unknown download error"}
 
 
 def get_duration(video_path: str) -> float:
@@ -126,15 +171,26 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 0.5, max_frame
 
 
 def transcribe_audio(video_path: str, audio_path: str) -> str:
-    """Extract and transcribe audio."""
+    """Extract and transcribe audio.
+
+    Uses forgiving flags (-y, -f wav, -avoid_negative_ts make_zero) for
+    TikTok/mobile mp4s that often have odd audio stream timing. On failure
+    surfaces real ffmpeg stderr instead of a bare CalledProcessError.
+    """
     import whisper
 
     # Extract audio
-    subprocess.run([
-        "ffmpeg", "-i", video_path,
+    result = subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        "-f", "wav",
+        "-avoid_negative_ts", "make_zero",
         audio_path
-    ], capture_output=True, check=True)
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "")[-600:]
+        raise RuntimeError(f"ffmpeg audio extraction failed (exit {result.returncode}): {stderr_tail}")
 
     # Transcribe
     model = whisper.load_model("base")
