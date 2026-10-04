@@ -38,7 +38,7 @@ modal token set --token-id YOUR_TOKEN_ID --token-secret YOUR_TOKEN_SECRET
 ### 3. Deploy
 
 ```bash
-git clone https://github.com/codependentai/video-watch-mcp.git
+git clone https://github.com/nekyialabs/video-watch-mcp.git
 cd video-watch-mcp
 modal deploy mcp_remote.py
 ```
@@ -145,7 +145,7 @@ Your MCP URL stays the same, no client config changes needed.
 **Coming from the old `maryfellowes/video-watch-mcp` repo?** That repo has been removed. Update your remote:
 
 ```bash
-git remote set-url origin https://github.com/codependentai/video-watch-mcp.git
+git remote set-url origin https://github.com/nekyialabs/video-watch-mcp.git
 git pull
 modal deploy mcp_remote.py
 ```
