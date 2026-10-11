@@ -67,10 +67,14 @@ def download_video(url: str, video_path: str) -> dict:
     # we verify the *downloaded file* with ffprobe and climb the ladder if
     # audio is missing. For TikTok, h264 first; watermarked "download" format
     # last (TikTok's own export — ugly but always has sound).
-    general_fmt = "bestvideo*+bestaudio/best"
+    # Cap at 720p where a 720p-or-lower variant exists (frames are sampled at
+    # 0.5 fps for the model, so higher resolution mostly costs download time and
+    # Modal processing); fall back to uncapped only if nothing <=720p merges.
+    general_fmt = "bv*[height<=720]+ba/b[height<=720]/bestvideo*+bestaudio/best"
     if is_tiktok:
         fmts = [
-            "b[vcodec^=h264]/bv*[vcodec^=h264]+ba",  # honest codec first
+            "b[vcodec^=h264][height<=720]/bv*[vcodec^=h264][height<=720]+ba"
+            "/b[vcodec^=h264]/bv*[vcodec^=h264]+ba",  # honest codec first, <=720p preferred
             general_fmt,                              # whatever merges
             "download",                               # watermarked, real audio
         ]
