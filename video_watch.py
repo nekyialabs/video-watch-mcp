@@ -46,12 +46,27 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 0.5) -> list[s
 
 
 def extract_audio(video_path: str, output_path: str) -> str:
-    """Extract audio from video as wav file."""
-    subprocess.run([
-        "ffmpeg", "-i", video_path,
-        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+    """Extract audio from video as wav file.
+
+    Uses forgiving flags to handle TikTok/mobile mp4s that sometimes have
+    odd audio stream timing or muxing. Logs ffmpeg stderr on failure so
+    the caller (or logs) can see the exact cause rather than just a
+    non-zero exit.
+    """
+    result = subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        "-f", "wav",
+        "-avoid_negative_ts", "make_zero",
         output_path
-    ], capture_output=True, check=True)
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "")[-600:]
+        raise RuntimeError(f"ffmpeg audio extraction failed (exit {result.returncode}): {stderr_tail}")
     return output_path
 
 
